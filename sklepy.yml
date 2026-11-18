@@ -11,7 +11,7 @@ alarm:
   blad_cenowy_od_proc: 60          # od tylu % zniżki alert ma etykietę 🚨 BŁĄD CENOWY
   min_cena_zl: 8                   # ignoruj tańsze niż tyle zł (próbki, saszetki)
   min_zysk_zl: 15                  # tylko gdy szacowany zysk z odsprzedaży ≥ tyle zł (0 = wszystko)
-  max_wiadomosci_na_przebieg: 15
+  max_wiadomosci_na_przebieg: 30   # na jeden przebieg (reszta w /top)
 
 sprzedaz:                          # do liczenia zysku
   prowizja_proc: 11                # Allegro ok. 10–12%, Vinted 0%
@@ -19,7 +19,7 @@ sprzedaz:                          # do liczenia zysku
 
 ceneo:
   sprawdzaj: tak                   # podejrzane produkty porównuje z innymi ofertami na Ceneo (po EAN)
-  max_zapytan_na_przebieg: 25
+  max_zapytan_na_przebieg: 40
 
 pepper:
   wlaczony: tak                    # alert z każdego nowego wpisu „Błąd cenowy” na Pepper.pl
@@ -45,10 +45,10 @@ skan:
   promocje_najpierw: tak           # sam znajduje w sklepie strony promocji/wyprzedaży/outletu i sprawdza je jako pierwsze
   promocje_max_list: 8             # ile różnych stron promocji na sklep
   promocje_max_stron: 30           # ile kolejnych stron (1, 2, 3…) każdej promocji
-  produktow_na_przebieg: 1500      # ile produktów na sklep w jednym przebiegu
-  rownolegle: 3
-  przerwa_s: 0.6                   # przerwa między zapytaniami do jednego sklepu (sam zwalnia, gdy trzeba)
-  limit_minut: 20
+  produktow_na_przebieg: 2500      # ile produktów na sklep w jednym przebiegu
+  rownolegle: 4                    # ile stron naraz z jednego sklepu
+  przerwa_s: 0.4                   # przerwa między zapytaniami do jednego sklepu (sam zwalnia, gdy trzeba)
+  limit_minut: 22
   telefon_co_minut: 15             # tylko tryb telefonu
 
 telegram:
