@@ -1,0 +1,144 @@
+# ============================================================
+#  POSZUKIWACZ STEALI v2 – ustawienia
+#  Zmieniaj tylko wartości po dwukropku: "tak" / "nie" albo liczby.
+#  Linie z # to komentarze – nic nie robią.
+# ============================================================
+
+alarm:
+  spadek_vs_historia_proc: 35      # cena o tyle % niższa niż ZWYKLE w tym sklepie
+  taniej_niz_inne_sklepy_proc: 25  # ten sam produkt (EAN) o tyle % taniej niż w innych sklepach
+  taniej_niz_ceneo_proc: 25        # o tyle % taniej niż inne oferty na Ceneo
+  blad_cenowy_od_proc: 60          # od tylu % zniżki alert ma etykietę 🚨 BŁĄD CENOWY
+  min_cena_zl: 8                   # ignoruj tańsze niż tyle zł (próbki, saszetki)
+  min_zysk_zl: 15                  # tylko gdy szacowany zysk z odsprzedaży ≥ tyle zł (0 = wszystko)
+  max_wiadomosci_na_przebieg: 15
+
+sprzedaz:                          # do liczenia zysku
+  prowizja_proc: 11                # Allegro ok. 10–12%, Vinted 0%
+  koszt_wysylki_zl: 12
+
+ceneo:
+  sprawdzaj: tak                   # podejrzane produkty porównuje z innymi ofertami na Ceneo (po EAN)
+  max_zapytan_na_przebieg: 25
+
+pepper:
+  wlaczony: tak                    # alert z każdego nowego wpisu „Błąd cenowy” na Pepper.pl
+  slowa:                           # + nowe okazje z Pepper, których tytuł zawiera któreś z tych słów
+    - perfum
+    - woda perfumowana
+    - woda toaletowa
+    - edp
+    - edt
+    - tester
+    - notino
+    - douglas
+    - sephora
+    - rossmann
+    - hebe
+    - elnino
+    - e-glamour
+    - kapsułki do prania
+    - proszek do prania
+    - tabletki do zmywarki
+
+skan:
+  promocje_najpierw: tak           # sam znajduje w sklepie strony promocji/wyprzedaży/outletu i sprawdza je jako pierwsze
+  promocje_max_list: 8             # ile różnych stron promocji na sklep
+  promocje_max_stron: 30           # ile kolejnych stron (1, 2, 3…) każdej promocji
+  produktow_na_przebieg: 1500      # ile produktów na sklep w jednym przebiegu
+  rownolegle: 3
+  przerwa_s: 0.6                   # przerwa między zapytaniami do jednego sklepu (sam zwalnia, gdy trzeba)
+  limit_minut: 20
+  telefon_co_minut: 15             # tylko tryb telefonu
+
+telegram:
+  max_odbiorcow: 2                 # ile osób może zapisać się przez /start
+  token: ""                        # TYLKO na telefonie wklej token. Na GitHubie zostaw puste (token idzie do Secrets)!
+
+# ------------------------------------------------------------
+#  SKLEPY
+#  wlaczony: tak/nie
+#  gdzie: wszedzie | github | telefon
+#  tylko_promocje: tak  → skanuj tylko promocje/wyprzedaże (szybciej), nie: cały sklep + promocje najpierw
+#  promocje: (opcjonalnie) własne adresy stron promocji – reszta wykrywana automatycznie
+#  filtr: (opcjonalnie) tylko adresy zawierające ten tekst
+# ------------------------------------------------------------
+sklepy:
+  # --- Twoje sklepy ---
+  - nazwa: Dr.Max
+    adres: https://www.drmax.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Zapachnisci
+    adres: https://zapachnisci.com.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Zooplus
+    adres: https://www.zooplus.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: e-Glamour
+    adres: https://www.e-glamour.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Elnino Parfum
+    adres: https://elnino-parfum.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Notino
+    adres: https://www.notino.pl
+    wlaczony: tak
+    gdzie: wszedzie
+    promocje:
+      - https://www.notino.pl/aktualne-promocje/
+
+  # --- dodane: perfumerie i drogerie, w których trafiają się błędy i duże przeceny ---
+  - nazwa: Douglas
+    adres: https://www.douglas.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Sephora
+    adres: https://www.sephora.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Ezebra
+    adres: https://www.ezebra.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Hebe
+    adres: https://www.hebe.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Rossmann
+    adres: https://www.rossmann.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  - nazwa: Super-Pharm
+    adres: https://www.superpharm.pl
+    wlaczony: tak
+    gdzie: wszedzie
+
+  # --- dodane: apteki internetowe (kosmetyki, chemia, perfumy) ---
+  - nazwa: DOZ
+    adres: https://www.doz.pl
+    wlaczony: tak
+    gdzie: wszedzie
+    tylko_promocje: tak            # ogromny katalog leków – bierzemy tylko promocje
+    promocje:
+      - https://www.doz.pl/promocje
+
+  - nazwa: Gemini
+    adres: https://gemini.pl
+    wlaczony: tak
+    gdzie: wszedzie
+    tylko_promocje: tak
