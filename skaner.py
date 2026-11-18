@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-POSZUKIWACZ STEALI v2 – skaner błędów cenowych i mega okazji + bot Telegram.
+POSZUKIWACZ STEALI v4 – skaner błędów cenowych i mega okazji + bot Telegram.
 
 Co robi w każdym przebiegu:
  1. PROMOCJE NAJPIERW – sam znajduje w każdym sklepie strony „promocje / wyprzedaż / outlet /
@@ -31,6 +31,7 @@ import re
 import statistics
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urljoin, urlparse, urldefrag
 
@@ -302,9 +303,38 @@ def pojemnosc(tekst):
     return float(m.group(1).replace(",", ".")) if m else None
 
 
-def wyciagnij_produkty(tekst):
-    """Lista wariantów ze strony produktu: dict(nazwa, ean, cena, dostepny, wariant, sku)."""
-    wynik = []
+
+def _produkty_ld(dane):
+    """(id_grupy, obiekt Product, nazwa_rodzica). Warianty z hasVariant dostają grupę rodzica."""
+    grupa = [0]
+    lista = [False]
+
+    def chodz(d):
+        if isinstance(d, list):
+            for x in d:
+                yield from chodz(x)
+        elif isinstance(d, dict):
+            t = _typ(d)
+            if "ItemList" in t or "OfferCatalog" in t:
+                lista[0] = True
+            if "Product" in t:
+                grupa[0] += 1
+                g = grupa[0]
+                yield g, d, ""
+                for w in d.get("hasVariant") or []:
+                    if isinstance(w, dict):
+                        yield g, w, str(d.get("name", ""))
+            for kl in ("@graph", "mainEntity", "itemListElement", "item"):
+                if kl in d:
+                    yield from chodz(d[kl])
+
+    wynik = list(chodz(dane))
+    return wynik, lista[0]
+
+
+def analizuj_strone(tekst, adres=""):
+    """{'produkty': [...], 'lista': bool}. Lista = strona kategorii/wyszukiwania z wieloma różnymi produktami."""
+    wynik, lista = [], False
     for m in re.finditer(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", tekst, re.S | re.I):
         surowe = m.group(1).strip()
         try:
@@ -314,11 +344,14 @@ def wyciagnij_produkty(tekst):
                 dane = json.loads(re.sub(r"[\x00-\x1f]", " ", surowe))
             except ValueError:
                 continue
-        for o in _obiekty(dane):
-            if "Product" not in _typ(o):
-                continue
-            nazwa = htmllib.unescape(str(o.get("name", "")).strip())
+        obiekty, czy_lista = _produkty_ld(dane)
+        lista = lista or czy_lista
+        for g, o, rodzic in obiekty:
+            nazwa = htmllib.unescape(str(o.get("name") or rodzic).strip())
+            if rodzic and rodzic.lower() not in nazwa.lower():
+                nazwa = f"{htmllib.unescape(rodzic)} {nazwa}"
             ean_prod = _ean(o)
+            url_prod = str(o.get("url") or "")
             oferty = o.get("offers") or []
             if isinstance(oferty, dict):
                 oferty = oferty["offers"] if "AggregateOffer" in _typ(oferty) and oferty.get("offers") else [oferty]
@@ -337,18 +370,19 @@ def wyciagnij_produkty(tekst):
                 if str(of.get("priceCurrency", "PLN")).upper() not in ("PLN", "ZŁ", "ZL", ""):
                     continue
                 wynik.append({
-                    "nazwa": nazwa,
+                    "grupa": g, "nazwa": nazwa,
                     "ean": _ean(of) or ean_prod,
                     "cena": round(cena, 2),
                     "dostepny": not re.search(r"OutOfStock|SoldOut|Discontinued", str(of.get("availability", "")), re.I),
                     "wariant": str(of.get("name") or "").strip(),
                     "sku": str(of.get("sku") or o.get("sku") or "").strip(),
+                    "url": urljoin(adres, str(of.get("url") or url_prod)) if (of.get("url") or url_prod) else "",
+                    "zbiorcza": "lowPrice" in of and not of.get("price"),
                 })
-    if not wynik:   # zapas: znaczniki meta / microdata
+    if not wynik:   # zapas: znaczniki meta / microdata (zawsze pojedynczy produkt)
         cena = None
         for wz in (r'<meta[^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)["\'][^>]+content=["\']([^"\']+)',
-                   r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)',
-                   r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)'):
+                   r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)'):
             m = re.search(wz, tekst, re.I)
             if m and cena_z_tekstu(m.group(1)):
                 cena = cena_z_tekstu(m.group(1))
@@ -357,33 +391,86 @@ def wyciagnij_produkty(tekst):
             m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', tekst, re.I) \
                 or re.search(r"<title>(.*?)</title>", tekst, re.S | re.I)
             e = re.search(r'itemprop=["\']gtin1?3?["\'][^>]*content=["\'](\d{8,14})', tekst, re.I)
-            wynik.append({"nazwa": htmllib.unescape(m.group(1).strip()) if m else "", "ean": e.group(1) if e else "",
-                          "cena": round(cena, 2), "dostepny": True, "wariant": "", "sku": ""})
+            wynik.append({"grupa": 1, "nazwa": htmllib.unescape(m.group(1).strip()) if m else "",
+                          "ean": e.group(1) if e else "", "cena": round(cena, 2), "dostepny": True,
+                          "wariant": "", "sku": "", "url": "", "zbiorcza": False})
     uniq, widziane = [], set()
     for w in wynik:
-        kl = (w["ean"], w["sku"], w["wariant"], w["cena"])
+        kl = (w["ean"], w["sku"], w["wariant"], w["cena"], w["nazwa"])
         if kl not in widziane:
             widziane.add(kl)
             uniq.append(w)
-    # warianty bez EAN/SKU, które dublują ofertę zbiorczą rodzica – wyrzuć
-    if len(uniq) > 1 and any(w["ean"] or w["sku"] for w in uniq):
-        uniq = [w for w in uniq if w["ean"] or w["sku"] or w["wariant"]]
-    return uniq
+    # oferta zbiorcza rodzica ("od 99 zł") obok konkretnych wariantów – wyrzuć
+    if any(not w["zbiorcza"] for w in uniq):
+        uniq = [w for w in uniq if not w["zbiorcza"]]
+    # wiele RÓŻNYCH produktów (różne grupy i różne nazwy) = strona listy, nie produkt
+    grupy = {}
+    for w in uniq:
+        grupy.setdefault(w["grupa"], set()).add(re.sub(r"[^a-z]", "", w["nazwa"].lower())[:25])
+    nazwy = set().union(*grupy.values()) if grupy else set()
+    if len(grupy) >= 3 or (len(grupy) == 2 and len(nazwy) >= 2):
+        lista = True
+    return {"produkty": uniq, "lista": lista}
+
+
+def wyciagnij_produkty(tekst):
+    return analizuj_strone(tekst)["produkty"]
 
 
 def bledy_wariantow(produkty):
-    """Większe opakowanie tańsze niż mniejsze = typowy błąd cenowy. Zwraca {index: cena_odniesienia}."""
-    z_ml = [(i, pojemnosc(p["wariant"] or p["nazwa"]), p["cena"]) for i, p in enumerate(produkty) if p["dostepny"]]
-    z_ml = [x for x in z_ml if x[1]]
+    """Większe opakowanie TEGO SAMEGO produktu tańsze niż mniejsze. Zwraca {index: cena_odniesienia}."""
     wynik = {}
-    for i, ml, cena in z_ml:
-        mniejsze = [(m2, c2) for j, m2, c2 in z_ml if m2 < ml and j != i]
-        if not mniejsze:
+    for g in {p["grupa"] for p in produkty}:
+        z_ml = []
+        for i, p in enumerate(produkty):
+            if p["grupa"] != g or not p["dostepny"]:
+                continue
+            m = ML.search(p["wariant"] or "") or ML.search(p["nazwa"] or "")
+            if m:
+                z_ml.append((i, float(m.group(1).replace(",", ".")), m.group(2).lower(), p["cena"]))
+        if len({x[1] for x in z_ml}) < 2:
             continue
-        m2, c2 = max(mniejsze)             # najbliższe mniejsze opakowanie
-        if cena < c2 * 0.95:
-            wynik[i] = round(c2 * (ml / m2) * 0.75, 2)   # ostrożnie: większe zwykle ~25% taniej za ml
+        for i, ml, jed, cena in z_ml:
+            mniejsze = [(m2, c2) for j, m2, j2, c2 in z_ml if j != i and j2 == jed and 5 <= m2 < ml and ml / m2 <= 10]
+            if not mniejsze:
+                continue
+            m2, c2 = max(mniejsze)
+            if cena < c2 * 0.9:
+                wynik[i] = round(c2 * 1.05, 2)    # ostrożnie: większe nie powinno być tańsze niż mniejsze
     return wynik
+
+
+TYP_ZAPACHU = [(r"eau de parfum|woda perfumowana|\bedp\b", "edp"), (r"eau de toilette|woda toaletowa|\bedt\b", "edt"),
+               (r"eau de cologne|woda kolo[nń]ska|\bedc\b", "edc"), (r"extrait|ekstrakt perfum|(?<!de )\bparfum\b(?! de)", "parfum"),
+               (r"\btester\b|bez pude[lł]ka|unboxed", "tester"), (r"zestaw|\bset\b|gift|kpl\.|komplet", "zestaw"),
+               (r"refill|uzupe[lł]nienie|wk[lł]ad", "refill"), (r"pr[oó]bka|\bmini\b|miniatur", "mini")]
+NIEISTOTNE = set("woda perfumowana toaletowa dla kobiet mezczyzn meski damski damska meska unisex spray "
+                 "atomizer ml g szt sztuk flakon perfumy perfum eau de parfum toilette cologne the and for "
+                 "her him women men pour homme femme z i w na do edp edt edc tester zestaw set gift extrait refill mini "
+                 "probka kpl komplet bez pudelka unboxed".split())
+
+
+def klucz_nazwy(nazwa):
+    """Klucz porównania bez EAN: marka+nazwa+typ+POJEMNOŚĆ (100 ml porównuje się tylko ze 100 ml)."""
+    t = (nazwa or "").lower()
+    t = t.translate(str.maketrans("ąćęłńóśźżéèêàâôöüû", "acelnoszzeeeaaoouu"))
+    m = ML.search(t)
+    if not m:
+        return None
+    ml = f"{float(m.group(1).replace(',', '.')):g}" + m.group(2)
+    flagi = sorted({f for wz, f in TYP_ZAPACHU if re.search(wz, t)})
+    slowa = sorted({w for w in re.findall(r"[a-z0-9]{2,}", ML.sub(" ", t)) if w not in NIEISTOTNE and not w.isdigit()})
+    if len(slowa) < 2:
+        return None
+    return " ".join(slowa) + "|" + ml + "|" + ",".join(flagi)
+
+
+def za_100(cena, nazwa):
+    m = ML.search(nazwa or "")
+    if not m:
+        return ""
+    il = float(m.group(1).replace(",", "."))
+    return f" ({zl(cena / il * 100)}/100 {m.group(2).lower()})" if il >= 5 else ""
 
 
 # ---------------------------------------------------------------- historia
@@ -407,6 +494,7 @@ def dopisz_historie(item, cena, teraz):
 class Telegram:
     def __init__(self, token, stan, max_odb):
         self.token, self.stan, self.max = token, stan, max_odb
+        self.zamek = threading.Lock()
 
     def _api(self, metoda, **p):
         if not self.token:
@@ -417,13 +505,30 @@ class Telegram:
             log("Telegram błąd:", e)
             return None
 
-    def wyslij(self, tekst, do=None):
-        for chat in ([do] if do else list(self.stan.setdefault("odbiorcy", []))):
-            r = self._api("sendMessage", chat_id=chat, text=tekst[:4000], parse_mode="HTML",
-                          disable_web_page_preview="true")
-            if r and not r.get("ok") and "parse" in str(r.get("description", "")).lower():
-                self._api("sendMessage", chat_id=chat, text=re.sub(r"<[^>]+>", "", tekst)[:4000])
-            time.sleep(0.35)
+    def wyslij(self, tekst, do=None, przyciski=None, podglad=None):
+        """przyciski: [(tekst, url), ...] – duże klikalne przyciski pod wiadomością.
+        podglad: adres strony, której podgląd (zdjęcie produktu) ma pokazać Telegram."""
+        extra = {}
+        if przyciski:
+            rzedy = [[{"text": t, "url": u}] for t, u in przyciski[:1]]
+            if len(przyciski) > 1:
+                rzedy.append([{"text": t, "url": u} for t, u in przyciski[1:3]])
+            extra["reply_markup"] = json.dumps({"inline_keyboard": rzedy})
+        if podglad:
+            extra["link_preview_options"] = json.dumps({"url": podglad, "prefer_small_media": True, "show_above_text": False})
+        else:
+            extra["disable_web_page_preview"] = "true"
+        with self.zamek:
+            for chat in ([do] if do else list(self.stan.setdefault("odbiorcy", []))):
+                r = self._api("sendMessage", chat_id=chat, text=tekst[:4000], parse_mode="HTML", **extra)
+                if r and not r.get("ok"):
+                    if r.get("error_code") == 429:   # Telegram prosi o wolniej
+                        time.sleep(int((r.get("parameters") or {}).get("retry_after", 3)) + 1)
+                    extra.pop("link_preview_options", None)
+                    self._api("sendMessage", chat_id=chat, text=re.sub(r"<[^>]+>", "", tekst)[:4000],
+                              disable_web_page_preview="true",
+                              **({"reply_markup": extra["reply_markup"]} if "reply_markup" in extra else {}))
+                time.sleep(0.05)
 
     def komendy(self, obsluga):
         r = self._api("getUpdates", offset=self.stan.get("offset", 0), timeout=0)
@@ -457,6 +562,10 @@ class Skaner:
         self.sk = cfg.get("skan", {}) or {}
         self.k = Klient(float(self.sk.get("przerwa_s", 0.6)))
         self.stan = wczytaj_json(os.path.join(DANE, "stan.json"), {})
+        if self.stan.get("v") != 3:
+            for kl in ("wyslane", "ostatnie", "ceneo"):
+                self.stan.pop(kl, None)
+            self.stan["v"] = 3
         tg = cfg.get("telegram", {}) or {}
         token = os.environ.get("TELEGRAM_TOKEN") or str(tg.get("token") or "").strip()
         self.tg = Telegram(token, self.stan, int(tg.get("max_odbiorcow", 2)))
@@ -468,6 +577,9 @@ class Skaner:
         self.dane = {}
         self.koniec = 0
         self.ceneo_licznik = 0
+        self.ilock = threading.RLock()          # wspólny indeks cen i licznik alertów
+        self.po_ean, self.po_nazwie = {}, {}
+        self.na_sklep, self.pominiete, self.wyslanych = {}, 0, 0
 
     # ---------- komendy bota
     def obsluz(self, chat, cmd, tekst):
@@ -528,6 +640,9 @@ class Skaner:
                 linie.append("   ⚠️ blokuje – ustaw mu <i>gdzie: telefon</i>")
             elif not s.get("produktow") and s.get("sprawdzone"):
                 linie.append("   ⚠️ nie widzę cen – wyślij zrzut tego statusu do Claude")
+        c = self.stan.get("ceneo_status")
+        if c:
+            linie.append(f"{'🟢' if c == 'ok' else '🔴'} <b>Ceneo</b>: {esc(c)}")
         p = self.stan.get("pepper_status")
         if p:
             linie.append(f"{'🟢' if p == 'ok' else '🔴'} <b>Pepper</b>: {esc(p)}")
@@ -544,8 +659,8 @@ class Skaner:
         if not lista:
             return "Na razie brak okazji z ostatnich 48 h. Cierpliwości 🙂"
         return "🏆 <b>Najlepsze okazje (48 h)</b>\n" + "\n".join(
-            f"• -{x['proc']}% <a href=\"{esc(x['url'])}\">{esc(x['nazwa'][:60])}</a> – {zl(x['cena'])} ({esc(x['sklep'])})"
-            for x in lista[:12])
+            f"{i + 1}. <b>−{x['proc']}%</b>  {zl(x['cena'])}  ·  {esc(x['sklep'])}\n    <a href=\"{esc(x['url'])}\">{esc(x['nazwa'][:70])}</a>"
+            for i, x in enumerate(lista[:12]))
 
     # ---------- dane sklepu
     def plik(self, sklep):
@@ -553,6 +668,8 @@ class Skaner:
 
     def wczytaj_sklep(self, sklep):
         d = wczytaj_json(self.plik(sklep), {})
+        if d.get("v") != 3:
+            d = {"urls": d.get("urls", {}), "sitemap_ts": d.get("sitemap_ts", 0), "kursor": d.get("kursor", 0), "v": 3}
         for kl, v in (("urls", {}), ("kursor", 0), ("sitemap_ts", 0), ("nie", []), ("p", {}), ("nie_ts", TERAZ()),
                       ("pilne", []), ("promo_listy", []), ("promo_ts", 0), ("promo_kursor", 0)):
             d.setdefault(kl, v)
@@ -656,7 +773,7 @@ class Skaner:
     # ---------- skan jednego sklepu
     def skanuj_sklep(self, sklep):
         nazwa = sklep["nazwa"]
-        d = self.wczytaj_sklep(sklep)
+        d = self.dane.get(nazwa) or self.wczytaj_sklep(sklep)
         self.dane[nazwa] = d
         host = urlparse(sklep["adres"]).netloc
         try:
@@ -671,22 +788,39 @@ class Skaner:
                 log(f"[{nazwa}] produktów na promocjach: {len(promo)}")
             except Exception as e:
                 log(f"[{nazwa}] błąd promocji: {e!r}")
-        tylko_promo = tak(sklep.get("tylko_promocje", "nie"))
-        q = promo[: int(self.sk.get("produktow_na_przebieg", 1500))] if tylko_promo else self.kolejka(sklep, d, zmienione, promo)
+        budzet = int(self.sk.get("produktow_na_przebieg", 2500))
+        q = promo[:budzet] if tak(sklep.get("tylko_promocje", "nie")) else self.kolejka(sklep, d, zmienione, promo)
         promo_set = set(promo)
-        sprawdzone, kandydaci, lock, nie = [0], [], threading.Lock(), set(d["nie"])
+        kolejka, zrobione = deque(q), set()
+        sprawdzone, lock, nie = [0], threading.Lock(), set(d["nie"])
         min_cena = float(self.a.get("min_cena_zl", 8))
+        cena_url = {it["u"]: it.get("c") for it in d["p"].values()}
 
         def jeden(url):
-            if time.time() > self.koniec or self.k.zablokowany(host):
-                return
             tekst = self.k.get(url)
             if tekst is None:
                 return
-            produkty = wyciagnij_produkty(tekst)
+            strona = analizuj_strone(tekst, url)
+            produkty = strona["produkty"]
             teraz = TERAZ()
+            nowi = []
             with lock:
                 sprawdzone[0] += 1
+                if strona["lista"]:
+                    # strona kategorii: ceny z listy tylko jako wskazówka – produkty, które wyraźnie
+                    # potaniały, sprawdzamy NATYCHMIAST (na początek kolejki), resztę później
+                    for pr in produkty:
+                        u = pr["url"]
+                        if not u or u == url or not ten_sam_sklep(u, sklep["adres"]) or u in zrobione:
+                            continue
+                        stara = cena_url.get(u)
+                        if stara and pr["cena"] < stara * 0.85:
+                            kolejka.appendleft(u)
+                        else:
+                            d["pilne"].append(u)
+                    if url not in promo_set:
+                        nie.add(url)
+                    return
                 if not produkty:
                     if BLOKADA.search(tekst[:40000]) and len(tekst) < 200000:
                         self.k.zglos_blokade(host)
@@ -697,11 +831,13 @@ class Skaner:
                 warianty = bledy_wariantow(produkty) if wielu else {}
                 for i, pr in enumerate(produkty):
                     klucz = url + ("#" + (pr["ean"] or pr["sku"] or str(i)) if wielu else "")
-                    it = d["p"].setdefault(klucz, {"u": url})
+                    wlasny = pr["url"] if pr["url"] and ten_sam_sklep(pr["url"], sklep["adres"]) else url
+                    it = d["p"].setdefault(klucz, {"u": wlasny})
+                    it["u"] = wlasny
                     nz = pr["nazwa"]
                     if wielu and pr["wariant"] and pr["wariant"].lower() not in nz.lower():
                         nz += f" – {pr['wariant']}"
-                    it.update({"n": nz[:160], "e": pr["ean"], "t": teraz, "a": pr["dostepny"]})
+                    it.update({"n": nz[:160], "e": pr["ean"], "t": teraz, "a": pr["dostepny"], "k": klucz_nazwy(nz)})
                     stara = it.get("c")
                     zwykla = zwykla_cena(it.get("h", []), teraz)
                     it["c"] = pr["cena"]
@@ -710,28 +846,52 @@ class Skaner:
                     if stara and pr["cena"] < stara * 0.9:
                         it["gor"] = teraz
                     if pr["dostepny"] and pr["cena"] >= min_cena:
-                        kandydaci.append({"sklep": nazwa, "klucz": klucz, "it": it, "zwykla": zwykla,
-                                          "wariant": warianty.get(i), "promo": url in promo_set})
+                        dni = len([1 for dz, _ in it.get("h", []) if dz < teraz // DZIEN])
+                        nowi.append({"sklep": nazwa, "klucz": klucz, "it": it, "zwykla": zwykla, "dni": dni,
+                                     "wariant": warianty.get(i), "promo": url in promo_set, "strona": url})
+            for k in nowi:                                    # ocena i alert od razu, bez czekania na koniec
+                self.dodaj_do_indeksu(nazwa, k["it"])
+                al = self.ocen_jeden(k)
+                if al:
+                    self.wyslij_jeden(al)
 
-        with ThreadPoolExecutor(max_workers=int(self.sk.get("rownolegle", 3))) as ex:
-            list(ex.map(jeden, q))
+        def pracownik():
+            while time.time() < self.koniec and not self.k.zablokowany(host):
+                with lock:
+                    while kolejka and kolejka[0] in zrobione:
+                        kolejka.popleft()
+                    if not kolejka:
+                        return
+                    url = kolejka.popleft()
+                    zrobione.add(url)
+                try:
+                    jeden(url)
+                except Exception as e:
+                    log(f"[{nazwa}] błąd strony {url}: {e!r}")
+
+        watki = [threading.Thread(target=pracownik) for _ in range(int(self.sk.get("rownolegle", 4)))]
+        for w in watki:
+            w.start()
+        for w in watki:
+            w.join()
         d["nie"] = list(nie)[-50000:]
         blok = self.k.zablokowany(host)
-        log(f"[{nazwa}] sprawdzono {sprawdzone[0]} stron, kandydatów {len(kandydaci)}" + (" ⚠️ BLOKADA" if blok else ""))
-        self.stan.setdefault("statystyki", {})[nazwa] = {
-            "produktow": len(d["p"]), "sprawdzone": sprawdzone[0], "blokada": blok,
-            "miejsce": self.miejsce, "promo": len(promo)}
-        return kandydaci
+        log(f"[{nazwa}] sprawdzono {sprawdzone[0]} stron" + (" ⚠️ BLOKADA" if blok else ""))
+        with self.ilock:
+            self.stan.setdefault("statystyki", {})[nazwa] = {
+                "produktow": len(d["p"]), "sprawdzone": sprawdzone[0], "blokada": blok,
+                "miejsce": self.miejsce, "promo": len(promo)}
+        return []
 
-    # ---------- Ceneo
     def ceneo(self, ean):
         cache = self.stan.setdefault("ceneo", {})
         c = cache.get(ean)
         if c and TERAZ() - c[1] < DZIEN:
             return c[0]
-        if self.ceneo_licznik <= 0 or self.k.zablokowany("www.ceneo.pl"):
-            return None
-        self.ceneo_licznik -= 1
+        with self.ilock:
+            if self.ceneo_licznik <= 0 or self.k.zablokowany("www.ceneo.pl"):
+                return None
+            self.ceneo_licznik -= 1
         tekst = self.k.get(f"https://www.ceneo.pl/;szukaj-{quote(ean)}", proby=1)
         ceny = None
         if tekst:
@@ -741,128 +901,163 @@ class Skaner:
                 r'class="value">\s*([\d\s]+)\s*</span>\s*<span class="penny">\s*,?(\d{2})', tekst)]
             ceny = sorted({round(x, 2) for x in lst if x})[:30] or None
         cache[ean] = [ceny, TERAZ()]
+        self.stan["ceneo_status"] = "ok" if tekst else "niedostępne z tego miejsca"
         if len(cache) > 5000:
             for kl in sorted(cache, key=lambda x: cache[x][1])[:1000]:
                 cache.pop(kl)
         return ceny
 
     # ---------- ocena
-    def ocen(self, kandydaci):
-        granica = TERAZ() - 4 * DZIEN
-        indeks = {}
-        for nazwa, d in self.dane.items():
-            for it in d["p"].values():
-                if it.get("e") and it.get("a") and it.get("t", 0) > granica and it.get("c"):
-                    indeks.setdefault(it["e"], []).append((nazwa, it["c"], it["u"]))
+
+    def dodaj_do_indeksu(self, sklep, it):
+        if not (it.get("a") and it.get("c") and it.get("t", 0) > TERAZ() - 4 * DZIEN):
+            return
+        o = (sklep, it["c"], it["u"])
+        with self.ilock:
+            if it.get("e"):
+                self.po_ean.setdefault(it["e"], {})[sklep + "|" + it["u"]] = o
+            if it.get("k"):
+                self.po_nazwie.setdefault(it["k"], {})[sklep + "|" + it["u"]] = o
+
+    def ocen_jeden(self, k):
+        """Cena rynkowa = mediana 3 najtańszych ofert TEGO SAMEGO produktu (EAN, a bez EAN: nazwa + pojemność)
+        w innych sklepach. Zwraca alert albo None. Alert wymaga ≥ 2 punktów pewności."""
+        it, cena = k["it"], k["it"]["c"]
         p_hist = float(self.a.get("spadek_vs_historia_proc", 35)) / 100
         p_inne = float(self.a.get("taniej_niz_inne_sklepy_proc", 25)) / 100
-        p_ceneo = float(self.a.get("taniej_niz_ceneo_proc", 25)) / 100
-        obs = self.stan.get("obserwowane", [])
-        alerty = []
-        for k in kandydaci:
-            it, cena = k["it"], k["it"]["c"]
-            k.update(sygnaly=[], odn=[], cel=None)
-            if k["zwykla"] and cena <= k["zwykla"] * (1 - p_hist):
-                k["sygnaly"].append("historia")
-                k["odn"].append(k["zwykla"])
-            inne = [(s, c, u) for s, c, u in indeks.get(it.get("e"), []) if s != k["sklep"]]
-            k["inne"] = sorted(inne, key=lambda x: x[1])[:3]
-            k["med_inne"] = statistics.median([c for _, c, _ in inne]) if inne else None
-            if k["med_inne"] and cena <= k["med_inne"] * (1 - p_inne):
-                k["sygnaly"].append("inne")
-                k["odn"].append(k["med_inne"])
-            if k["wariant"] and cena <= k["wariant"] * (1 - p_inne):
-                k["sygnaly"].append("wariant")
-                k["odn"].append(k["wariant"])
-            nazwa_l = (it.get("n") or "").lower()
-            for o in obs:
-                if cena <= o["c"] and all(s in nazwa_l for s in o["s"]):
-                    k["cel"] = o
-            if k["sygnaly"] or k["cel"]:
-                alerty.append(k)
-        # Ceneo tylko dla podejrzanych, najpierw największe różnice
-        self.ceneo_licznik = int((self.cfg.get("ceneo") or {}).get("max_zapytan_na_przebieg", 25))
-        alerty.sort(key=lambda x: -(1 - x["it"]["c"] / max(x["odn"] or [x["it"]["c"]])))
-        for al in alerty:
-            al["ceneo"] = None
-            if tak((self.cfg.get("ceneo") or {}).get("sprawdzaj", "tak")) and al["it"].get("e"):
-                ceny = self.ceneo(al["it"]["e"]) or []
-                wyzsze = [c for c in ceny if c > al["it"]["c"] * 1.02]   # pomijamy naszą własną ofertę na Ceneo
-                al["ceneo"] = wyzsze[0] if wyzsze else None
-                if al["ceneo"] and al["it"]["c"] <= al["ceneo"] * (1 - p_ceneo):
-                    al["sygnaly"].append("ceneo")
-                    al["odn"].append(al["ceneo"])
-        return alerty
+        k.update(sygnaly=[], odn=[], cel=None, pkt=0, ceneo=None)
+        with self.ilock:
+            oferty = list((self.po_ean.get(it.get("e")) or {}).values()) if it.get("e") else []
+            k["dopasowanie"] = "ten sam EAN" if oferty else "nazwa + pojemność"
+            if not oferty:
+                oferty = list((self.po_nazwie.get(it.get("k")) or {}).values())
+        najtansze = {}
+        for s_, c, u in oferty:
+            if s_ != k["sklep"] and (s_ not in najtansze or c < najtansze[s_][0]):
+                najtansze[s_] = (c, u)
+        inne = sorted((c, s_, u) for s_, (c, u) in najtansze.items())
+        k["inne"] = [(s_, c, u) for c, s_, u in inne[:3]]
+        k["rynek"] = statistics.median([c for c, _, _ in inne[:3]]) if inne else None
+        if k["rynek"] and cena <= k["rynek"] * (1 - p_inne):
+            k["sygnaly"].append("inne sklepy")
+            k["odn"].append(k["rynek"])
+            k["pkt"] += 2 if len(inne) >= 2 else 1
+        if k["zwykla"] and k["dni"] >= 2 and cena <= k["zwykla"] * (1 - p_hist):
+            k["sygnaly"].append("historia ceny")
+            k["odn"].append(k["zwykla"])
+            k["pkt"] += 2 if k["dni"] >= 5 else 1
+        if k["wariant"] and cena <= k["wariant"] * (1 - p_inne):
+            k["sygnaly"].append("mniejsze opakowanie droższe")
+            k["odn"].append(k["wariant"])
+            k["pkt"] += 1
+        nazwa_l = (it.get("n") or "").lower()
+        for o in self.stan.get("obserwowane", []):
+            if cena <= o["c"] and all(w in nazwa_l for w in o["s"]):
+                k["cel"] = o
+        if not k["pkt"] and not k["cel"]:
+            return None
+        if k["pkt"] >= 1 and it.get("e") and tak((self.cfg.get("ceneo") or {}).get("sprawdzaj", "tak")):
+            ceny = self.ceneo(it["e"]) or []
+            wyzsze = [c for c in ceny if c > cena * 1.02]          # bez naszej własnej oferty
+            k["ceneo"] = statistics.median(wyzsze[:3]) if wyzsze else None
+            if k["ceneo"] and cena <= k["ceneo"] * (1 - float(self.a.get("taniej_niz_ceneo_proc", 25)) / 100):
+                k["sygnaly"].append("Ceneo")
+                k["odn"].append(k["ceneo"])
+                k["pkt"] += 2
+        return k
 
-    def wyslij_alerty(self, alerty):
+    def wyslij_jeden(self, al):
+        """Decyzja + natychmiastowa wysyłka jednego alertu."""
+        it, cena = al["it"], al["it"]["c"]
+        teraz = TERAZ()
         prow = float(self.sp.get("prowizja_proc", 11)) / 100
         wys = float(self.sp.get("koszt_wysylki_zl", 12))
         min_zysk = float(self.a.get("min_zysk_zl", 15))
-        prog_bledu = float(self.a.get("blad_cenowy_od_proc", 60))
-        limit = int(self.a.get("max_wiadomosci_na_przebieg", 15))
-        wyslane = self.stan.setdefault("wyslane", {})
-        ostatnie = self.stan.setdefault("ostatnie", [])
-        teraz = TERAZ()
-        cisza = self.stan.get("cisza_do", 0) > teraz
-        gotowe = []
-        for al in alerty:
-            it, cena = al["it"], al["it"]["c"]
-            rynek = [x for x in (al["ceneo"], al["med_inne"], al["zwykla"], al["wariant"]) if x]
-            if al["sygnaly"]:
-                if al["ceneo"] and "ceneo" not in al["sygnaly"] and cena > al["ceneo"] * 0.9:
-                    al["sygnaly"] = []          # Ceneo: gdzie indziej jest podobnie tanio – to nie okazja
-                else:
-                    zysk = min(rynek) * (1 - prow) - cena - wys
-                    if min_zysk > 0 and zysk < min_zysk:
-                        al["sygnaly"] = []
-            if not al["sygnaly"] and not al["cel"]:
-                continue
-            proc = round((1 - cena / min(al["odn"])) * 100) if al["odn"] else 0
-            zysk = (min(rynek) * (1 - prow) - cena - wys) if rynek else None
+        if al["pkt"] < 2:
+            al["sygnaly"] = []
+        rynek = [x for x in (al["ceneo"], al["rynek"], al["zwykla"] if al["dni"] >= 2 else None) if x]
+        zysk = (min(rynek) * (1 - prow) - cena - wys) if rynek else None
+        if al["sygnaly"]:
+            if al["ceneo"] and "Ceneo" not in al["sygnaly"] and cena > al["ceneo"] * 0.9:
+                al["sygnaly"] = []                 # na Ceneo jest podobnie tanio – to nie okazja
+            elif min_zysk > 0 and (zysk or 0) < min_zysk:
+                al["sygnaly"] = []
+        if not al["sygnaly"] and not al["cel"]:
+            return
+        proc = round((1 - cena / min(al["odn"])) * 100) if al["odn"] else 0
+        with self.ilock:
+            wyslane = self.stan.setdefault("wyslane", {})
             poprz = wyslane.get(al["klucz"])
             if poprz and cena >= poprz[0] * 0.95 and (teraz - poprz[1] < 3 * DZIEN or not al["sygnaly"]):
-                continue                        # już wysłane (obserwowane – tylko gdy cena znów spadnie)
-            gotowe.append((proc, zysk or 0, al))
-        gotowe.sort(key=lambda x: (-x[0], -x[1]))
-        for proc, zysk, al in gotowe[:limit]:
-            it = al["it"]
-            if al["sygnaly"]:
-                nag = "🚨 <b>PRAWDOPODOBNY BŁĄD CENOWY</b>" if proc >= prog_bledu else "🔥 <b>MEGA OKAZJA</b>"
-                nag += f"  -{proc}%"
+                return
+            n = self.na_sklep.get(al["sklep"], 0) + 1
+            self.na_sklep[al["sklep"]] = n
+            limit = int(self.a.get("max_wiadomosci_na_przebieg", 30))
+            if n > 25:                             # zalew z jednego sklepu = zmiana strony, nie błędy
+                if n == 26:
+                    ost = self.stan.setdefault("ostrzezenia", {})
+                    if teraz - ost.get(al["sklep"], 0) > DZIEN:
+                        ost[al["sklep"]] = teraz
+                        self.tg.wyslij(f"⚠️ <b>{esc(al['sklep'])}</b>: podejrzanie dużo okazji naraz – "
+                                       f"wstrzymuję alerty z tego sklepu do następnego przebiegu.")
+                return
+            if self.wyslanych >= limit:
+                self.pominiete += 1
+                cisza = True
             else:
-                nag = "🎯 <b>OBSERWOWANY PRODUKT</b>"
-            linie = [nag, f"<b>{esc(it.get('n', '')[:150])}</b>", f"🏪 {esc(al['sklep'])}: <b>{zl(it['c'])}</b>"
-                     + ("  🏷 promocja" if al["promo"] else "")]
-            if al["zwykla"]:
-                linie.append(f"📉 Zwykle w tym sklepie: {zl(al['zwykla'])}")
-            if "wariant" in al["sygnaly"]:
-                linie.append(f"📦 Mniejsze opakowanie jest droższe! (oczekiwana ok. {zl(al['wariant'])})")
-            for s, c, _ in al["inne"]:
-                linie.append(f"🏬 {esc(s)}: {zl(c)}")
-            if al["ceneo"]:
-                linie.append(f"🔎 Ceneo (inne oferty) od: {zl(al['ceneo'])}")
-            if al["cel"]:
-                linie.append(f"🎯 Twój próg: {esc(' '.join(al['cel']['s']))} ≤ {zl(al['cel']['c'])}")
-            if zysk and al["sygnaly"]:
-                linie.append(f"💰 Szac. zysk przy odsprzedaży: <b>~{zl(zysk)}</b>/szt.")
-            if it.get("e"):
-                linie.append(f"🏷 EAN: <code>{it['e']}</code>")
-            linie.append(f"👉 <a href=\"{esc(it['u'])}\">KUP / otwórz</a>"
-                         + (f" | <a href=\"https://www.ceneo.pl/;szukaj-{it['e']}\">Ceneo</a>" if it.get("e") else ""))
-            linie.append("⚡ Błędy znikają szybko – kupuj od razu, sprawdź cenę w koszyku.")
+                cisza = self.stan.get("cisza_do", 0) > teraz
+            wyslane[al["klucz"]] = [cena, teraz]
+        if proc >= 85 and al["sygnaly"]:           # skrajna zniżka – sprawdź jeszcze raz stronę produktu
+            tekst = self.k.get(al["strona"], proby=1) or ""
+            if not any(abs(p["cena"] - cena) < 0.01 for p in analizuj_strone(tekst, al["strona"])["produkty"]):
+                return
+        nazwa = it.get("n", "")
+        if al["sygnaly"]:
+            gw = "★" * min(al["pkt"], 5)
+            if proc >= float(self.a.get("blad_cenowy_od_proc", 60)):
+                linie = [f"🚨🚨 <b>BŁĄD CENOWY  −{proc}%</b>"]
+            else:
+                linie = [f"🔥 <b>MEGA OKAZJA  −{proc}%</b>"]
+        else:
+            gw = ""
+            linie = ["🎯 <b>TWÓJ OBSERWOWANY PRODUKT</b>"]
+        linie += [f"<b>{esc(nazwa[:140])}</b>", "",
+                  f"💸 <b>{zl(cena)}</b> w <b>{esc(al['sklep'])}</b>{za_100(cena, nazwa)}"
+                  + ("  🏷 promocja" if al["promo"] else "")]
+        porown = []
+        if al["rynek"]:
+            porown.append(f"rynek {zl(al['rynek'])}")
+        if al["zwykla"] and al["dni"] >= 2:
+            porown.append(f"zwykle tu {zl(al['zwykla'])}")
+        if al["ceneo"]:
+            porown.append(f"Ceneo {zl(al['ceneo'])}")
+        if porown:
+            linie.append("📊 " + "  ·  ".join(porown))
+        if al["inne"]:
+            linie.append("🏬 " + "  ·  ".join(f"<a href=\"{esc(u)}\">{esc(s_)}</a> {zl(c)}" for s_, c, u in al["inne"]))
+        if al["sygnaly"] and zysk:
+            linie.append(f"💰 Zysk przy odsprzedaży: <b>~{zl(zysk)}</b>/szt.")
+        if al["cel"]:
+            linie.append(f"🎯 Twój próg: {esc(' '.join(al['cel']['s']))} ≤ {zl(al['cel']['c'])}")
+        if gw:
+            linie.append(f"✅ Pewność {gw}  <i>({', '.join(al['sygnaly'])}"
+                         + (f"; porównanie: {al['dopasowanie']}" if al["inne"] else "") + ")</i>")
+        linie.append(f"⏱ {time.strftime('%H:%M', time.localtime(teraz))}  ·  sprawdź cenę w koszyku i kupuj od razu")
+        przyciski = [("🛒  OTWÓRZ PRODUKT  →", it["u"])]
+        if it.get("e"):
+            przyciski.append(("🔎 Ceneo", f"https://www.ceneo.pl/;szukaj-{it['e']}"))
+        if al["inne"]:
+            przyciski.append((f"🏬 {al['inne'][0][0]}", al["inne"][0][2]))
+        if not cisza:
+            self.tg.wyslij("\n".join(linie), przyciski=przyciski, podglad=it["u"])
+        with self.ilock:
             if not cisza:
-                self.tg.wyslij("\n".join(linie))
-            wyslane[al["klucz"]] = [it["c"], teraz]
-            ostatnie.append({"t": teraz, "proc": proc, "url": it["u"], "nazwa": it.get("n", ""),
-                             "cena": it["c"], "sklep": al["sklep"]})
+                self.wyslanych += 1
+            self.stan.setdefault("ostatnie", []).append(
+                {"t": teraz, "proc": proc, "url": it["u"], "nazwa": nazwa, "cena": cena, "sklep": al["sklep"]})
             self.stan["alertow"] = self.stan.get("alertow", 0) + 1
-            log(f"ALERT -{proc}% {it.get('n', '')[:60]} {zl(it['c'])}")
-        if len(gotowe) > limit and not cisza:
-            self.tg.wyslij(f"…i jeszcze {len(gotowe) - limit} okazji. Wpisz /top")
-        self.stan["ostatnie"] = [x for x in ostatnie if x["t"] > teraz - 7 * DZIEN][-300:]
-        self.stan["wyslane"] = {k: v for k, v in wyslane.items() if v[1] > teraz - 14 * DZIEN}
+        log(f"ALERT -{proc}% {nazwa[:60]} {zl(cena)} ({al['sklep']})")
 
-    # ---------- Pepper
     def pepper(self):
         pc = self.cfg.get("pepper") or {}
         if not tak(pc.get("wlaczony", "tak")):
@@ -913,35 +1108,42 @@ class Skaner:
             if typ == "blad" or "błąd cenowy" in tl or "blad cenowy" in tl or pasuje:
                 ikona = "🚨" if typ == "blad" or "błąd" in tl else "📢"
                 if self.stan.get("cisza_do", 0) <= TERAZ():
-                    self.tg.wyslij(f"{ikona} <b>Pepper</b>{' (' + esc(', '.join(pasuje)) + ')' if pasuje else ''}\n"
-                                   f"{esc(tytul)}\n👉 <a href=\"{esc(adr)}\">Otwórz</a>")
+                    self.tg.wyslij(f"{ikona} <b>PEPPER{' – BŁĄD CENOWY' if typ == 'blad' else ''}</b>"
+                                   f"{'  (' + esc(', '.join(pasuje)) + ')' if pasuje else ''}\n<b>{esc(tytul)}</b>",
+                                   przyciski=[("🛒  OTWÓRZ OKAZJĘ  →", adr)], podglad=adr)
         del widziane[:-1500]
 
     # ---------- jeden przebieg
     def przebieg(self):
         start = time.time()
-        self.koniec = start + float(self.sk.get("limit_minut", 20)) * 60
+        self.koniec = start + float(self.sk.get("limit_minut", 22)) * 60
         self.tg.komendy(self.obsluz)
         try:
             self.pepper()
         except Exception as e:
             log("Pepper błąd:", repr(e))
-        kandydaci = []
+        self.ceneo_licznik = int((self.cfg.get("ceneo") or {}).get("max_zapytan_na_przebieg", 40))
+        for s_ in self.cfg.get("sklepy", []) or []:          # indeks cen ze wszystkich sklepów od startu
+            if os.path.exists(self.plik(s_)):
+                self.dane[s_["nazwa"]] = self.wczytaj_sklep(s_)
+                for it in self.dane[s_["nazwa"]]["p"].values():
+                    self.dodaj_do_indeksu(s_["nazwa"], it)
+        log(f"Indeks rynkowy: {len(self.po_ean)} EAN, {len(self.po_nazwie)} nazw")
         with ThreadPoolExecutor(max_workers=max(1, len(self.sklepy))) as ex:
-            for wynik in ex.map(self._bezpiecznie, self.sklepy):
-                kandydaci += wynik
-        for s in self.cfg.get("sklepy", []) or []:       # do porównań EAN także sklepy skanowane gdzie indziej
-            if s["nazwa"] not in self.dane and os.path.exists(self.plik(s)):
-                self.dane[s["nazwa"]] = self.wczytaj_sklep(s)
-        self.wyslij_alerty(self.ocen(kandydaci))
-        for s in self.sklepy:
-            if s["nazwa"] in self.dane:
-                self.sprzataj(self.dane[s["nazwa"]])
-                zapisz_json(self.plik(s), self.dane[s["nazwa"]])
+            list(ex.map(self._bezpiecznie, self.sklepy))
+        if self.pominiete:
+            self.tg.wyslij(f"…i jeszcze {self.pominiete} okazji ponad limit wiadomości. Wpisz /top")
+        teraz = TERAZ()
+        self.stan["ostatnie"] = [x for x in self.stan.get("ostatnie", []) if x["t"] > teraz - 7 * DZIEN][-300:]
+        self.stan["wyslane"] = {k: v for k, v in self.stan.get("wyslane", {}).items() if v[1] > teraz - 14 * DZIEN}
+        for s_ in self.sklepy:
+            if s_["nazwa"] in self.dane:
+                self.sprzataj(self.dane[s_["nazwa"]])
+                zapisz_json(self.plik(s_), self.dane[s_["nazwa"]])
         self.tg.komendy(self.obsluz)
         self.stan["ostatni_przebieg"] = TERAZ()
         zapisz_json(os.path.join(DANE, "stan.json"), self.stan)
-        log(f"Gotowe w {int(time.time() - start)} s")
+        log(f"Gotowe w {int(time.time() - start)} s, wysłano {self.wyslanych}")
 
     def _bezpiecznie(self, sklep):
         try:
